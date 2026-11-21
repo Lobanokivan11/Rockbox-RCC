@@ -59,6 +59,7 @@ jobs:
           echo "BFD linker selection and map-file smoke test passed."
           echo "ANDROID_NDK_PATH=$NDK" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_PATH=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
 
       - name: Configure Rockbox Android target
         run: |
