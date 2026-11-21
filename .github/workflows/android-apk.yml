@@ -65,7 +65,7 @@ jobs:
         run: |
           mkdir -p build-android
           cd build-android
-          ../tools/configure --target=android --lcdwidth=1080 --lcdheight=2340 --eq-bands=30
+          ../tools/configure --target=android --lcdwidth=720 --lcdheight=1280 --eq-bands=30
 
       - name: Build native core and codecs
         run: make -C build-android -j2
