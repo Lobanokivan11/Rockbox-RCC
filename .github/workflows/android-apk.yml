@@ -1,0 +1,187 @@
+name: Build Rockbox RCC Android APK
+
+on:
+  push:
+    branches:
+      - android13-fix-work
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Java for Android SDK manager
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Install legacy Android platform and build tools
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager --install "platform-tools" "platforms;android-19" "build-tools;19.1.0"
+
+      - name: Install Java 8 for the legacy Android build
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '8'
+
+      - name: Install host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison flex perl zip unzip wget lib32stdc++6
+
+      - name: Install legacy NDK with ARMv5 GCC toolchain
+        run: |
+          # NDK r10e is distributed as a ZIP from the archived repository; the old .bin URL is invalid.
+          curl -fL --retry 3 -o /tmp/android-ndk-r10e-linux-x86_64.zip https://dl.google.com/android/repository/android-ndk-r10e-linux-x86_64.zip
+          unzip -q /tmp/android-ndk-r10e-linux-x86_64.zip -d "$GITHUB_WORKSPACE"
+          NDK="$GITHUB_WORKSPACE/android-ndk-r10e"
+          TOOLCHAIN="$NDK/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin"
+          test -x "$TOOLCHAIN/arm-linux-androideabi-gcc"
+          "$TOOLCHAIN/arm-linux-androideabi-gcc" --version
+          # Verify GCC can select the bundled BFD linker and emit the same map files used by codec links.
+          printf "int main(void) { return 0; }\n" | "$TOOLCHAIN/arm-linux-androideabi-gcc" --sysroot="$NDK/platforms/android-16/arch-arm" -fuse-ld=bfd -x c - -Wl,-Map,/tmp/android-bfd-test.map -o /tmp/android-bfd-test
+          test -s /tmp/android-bfd-test.map
+          echo "BFD linker selection and map-file smoke test passed."
+          echo "ANDROID_NDK_PATH=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_PATH=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
+
+      - name: Configure Rockbox Android target
+        run: |
+          mkdir -p build-android
+          cd build-android
+          ../tools/configure --target=android --lcdwidth=1080 --lcdheight=2340 --eq-bands=30
+
+      - name: Build native core and codecs
+        run: make -C build-android -j2
+
+      - name: Package Rockbox resources and APK
+        run: |
+          make -C build-android zip
+          make -C build-android apk
+
+      - name: Verify APK package, ABI, signature, alignment and native relocations
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$(find build-android -maxdepth 1 -type f -name 'rockbox-rcc-*.apk' -print -quit)"
+          test -n "$APK"
+          echo "APK=$APK" >> "$GITHUB_ENV"
+          "$ANDROID_HOME/build-tools/19.1.0/aapt" dump badging "$APK" | tee /tmp/badging.txt
+          grep -q "package: name='org.rockbox'" /tmp/badging.txt
+          unzip -Z1 "$APK" | grep -q '^lib/armeabi/librockbox.so$'
+          mkdir -p /tmp/apk-check
+          unzip -q "$APK" 'lib/armeabi/*.so' -d /tmp/apk-check
+          test -f /tmp/apk-check/lib/armeabi/librockbox.so
+          # Verify the complete Rockbox data archive is packaged in libmisc.so.
+          unzip -p "$APK" lib/armeabi/libmisc.so > /tmp/rockbox-resources.zip
+          unzip -tq /tmp/rockbox-resources.zip
+          unzip -Z1 /tmp/rockbox-resources.zip | tee /tmp/rockbox-resource-list.txt
+          grep -Fqx '.rockbox/rockbox-info.txt' /tmp/rockbox-resource-list.txt
+          grep -Fqx '.rockbox/themes/rockbox_failsafe.cfg' /tmp/rockbox-resource-list.txt
+          grep -Fqx '.rockbox/langs/chinese-simp.lng' /tmp/rockbox-resource-list.txt
+          grep -Eq '^\.rockbox/fonts/[^/]+\.fnt$' /tmp/rockbox-resource-list.txt
+          PLUGIN_COUNT=$(grep -Ec '^\.rockbox/rocks/(games|apps|demos|viewers)/[^/]+\.(rock|lua)$' /tmp/rockbox-resource-list.txt || true)
+          test "$PLUGIN_COUNT" -ge 20
+          echo "Rockbox resources verified: $PLUGIN_COUNT plugin entries and font payload present."
+          TEXTREL_FOUND=0
+          for so in /tmp/apk-check/lib/armeabi/*.so; do
+            if ! readelf -h "$so" >/dev/null 2>&1; then
+              echo "Skipping non-ELF payload: $so"
+              continue
+            fi
+            if readelf -d "$so" 2>/dev/null | grep -E 'TEXTREL|FLAGS.*TEXTREL'; then
+              echo "ERROR: text relocations remain in $so"
+              TEXTREL_FOUND=1
+            fi
+          done
+          if [ "$TEXTREL_FOUND" -ne 0 ]; then
+            echo "One or more Android native libraries still contain text relocations."
+            echo "===== librockbox.so dynamic section ====="
+            readelf -dW /tmp/apk-check/lib/armeabi/librockbox.so || true
+            echo "===== librockbox.so dynamic relocations ====="
+            readelf -rW /tmp/apk-check/lib/armeabi/librockbox.so || true
+            echo "===== librockbox.so section headers ====="
+            readelf -SW /tmp/apk-check/lib/armeabi/librockbox.so || true
+            TOOLCHAIN="$ANDROID_NDK_PATH/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin"
+            test -x "$TOOLCHAIN/arm-linux-androideabi-addr2line"
+            test -x "$TOOLCHAIN/arm-linux-androideabi-objdump"
+            echo "===== librockbox.so relocation source addresses ====="
+            "$TOOLCHAIN/arm-linux-androideabi-addr2line" -f -C -e /tmp/apk-check/lib/armeabi/librockbox.so 0x8ad84 0x8ad88 0x8ad8c 0x94468 0x9449c 0x944d0 || true
+            echo "===== librockbox.so disassembly around text relocation targets ====="
+            "$TOOLCHAIN/arm-linux-androideabi-objdump" -d -j .text --start-address=0x8ad60 --stop-address=0x8ada0 /tmp/apk-check/lib/armeabi/librockbox.so || true
+            "$TOOLCHAIN/arm-linux-androideabi-objdump" -d -j .text --start-address=0x94448 --stop-address=0x944e0 /tmp/apk-check/lib/armeabi/librockbox.so || true
+            echo "===== linker map input sections covering text relocation targets ====="
+            MAP="build-android/rockbox.map"
+            if [ -s "$MAP" ]; then
+          python3 - "$MAP" <<'PY'
+          import sys
+          targets = [0x8ad84, 0x8ad88, 0x8ad8c, 0x94468, 0x9449c, 0x944d0]
+          rows = []
+          with open(sys.argv[1], errors="replace") as map_file:
+              for number, line in enumerate(map_file, 1):
+                  parts = line.split(None, 3)
+                  if len(parts) >= 3 and parts[0].startswith(".") and parts[1].startswith("0x") and parts[2].startswith("0x"):
+                      address, size = int(parts[1], 16), int(parts[2], 16)
+                      rows.append((number, address, size, line.rstrip()))
+          for target in targets:
+              matches = [row for row in rows if row[1] <= target < row[1] + row[2]]
+              print("target 0x%x:" % target)
+              for row in matches:
+                  print("  map line %d: %s" % (row[0], row[3]))
+              if not matches:
+                  print("  no input-section range matched")
+          PY
+            else
+              echo "ERROR: expected $MAP was not generated"
+            fi
+            exit 1
+          fi
+          "$ANDROID_HOME/build-tools/19.1.0/zipalign" -c 4 "$APK"
+          echo "zipalign verification passed."
+          jarsigner -verify -verbose -certs "$APK" > /tmp/jarsigner-verify.txt 2>&1
+          grep -Fq 'jar verified.' /tmp/jarsigner-verify.txt
+          grep -Fq 'Digest algorithm: SHA-256' /tmp/jarsigner-verify.txt
+          grep -Fq 'Signature algorithm: SHA256withRSA, 2048-bit key' /tmp/jarsigner-verify.txt
+          if grep -Eiq 'treated as unsigned|weak algorithm|disabled by the security property|MD5withRSA|SHA1 \(disabled\)' /tmp/jarsigner-verify.txt; then
+            cat /tmp/jarsigner-verify.txt
+            echo "ERROR: APK signature is weak or was not verified."
+            exit 1
+          fi
+          echo "jarsigner verification passed with SHA-256 / SHA256withRSA-2048."
+          sha256sum "$APK" | tee /tmp/apk-sha256.txt
+          echo "Verified APK: $APK"
+
+      - name: Upload diagnostic APK when native verification fails
+        if: failure() && env.APK != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: rockbox-rcc-diagnostic-unverified
+          path: |
+            ${{ env.APK }}
+            build-android/rockbox.map
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Upload verified APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: rockbox-rcc-android13-armeabi
+          path: ${{ env.APK }}
+          if-no-files-found: error
+          retention-days: 14
